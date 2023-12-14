@@ -3,6 +3,8 @@ package controller
 import (
 	"context"
 	"fmt"
+	"time"
+
 	rolloutv1alpha1 "github.com/argoproj/argo-rollouts/pkg/apis/rollouts/v1alpha1"
 	ottoscaleriov1alpha1 "github.com/flipkart-incubator/ottoscalr/api/v1alpha1"
 	. "github.com/onsi/ginkgo/v2"
@@ -12,7 +14,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"time"
 )
 
 //+kubebuilder:docs-gen:collapse=Imports
@@ -94,6 +95,7 @@ var _ = Describe("PolicyRecommendationRegistrar controller", func() {
 			Expect(createdPolicy.Name).Should(Equal(RolloutName))
 			Expect(createdPolicy.Namespace).Should(Equal(RolloutNamespace))
 			Expect(createdPolicy.Spec.Policy).Should(Equal("safest-policy"))
+			Expect(createdPolicy.Spec.WorkloadMeta.Kind).Should(Equal("Rollout"))
 			Expect(createdPolicy.OwnerReferences[0].Name).Should(Equal(RolloutName))
 			Expect(createdPolicy.OwnerReferences[0].Kind).Should(Equal("Rollout"))
 			Expect(createdPolicy.OwnerReferences[0].APIVersion).Should(Equal("argoproj.io/v1alpha1"))
@@ -412,6 +414,9 @@ var _ = Describe("PolicyRecommendationRegistrar controller", func() {
 				types.NamespacedName{Name: DeploymentName, Namespace: DeploymentNamespace},
 				createdPolicy)).Should(Succeed())
 
+			time.Sleep(3 * time.Second)
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: DeploymentName, Namespace: DeploymentNamespace},
+				createdDeployment)).Should(Succeed())
 			labels := map[string]string{"app1": "test-app-1"}
 			createdDeployment.Labels = labels
 

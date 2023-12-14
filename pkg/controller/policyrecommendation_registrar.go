@@ -2,9 +2,12 @@ package controller
 
 import (
 	"context"
+	"time"
+
 	argov1alpha1 "github.com/argoproj/argo-rollouts/pkg/apis/rollouts/v1alpha1"
 	ottoscaleriov1alpha1 "github.com/flipkart-incubator/ottoscalr/api/v1alpha1"
 	"github.com/flipkart-incubator/ottoscalr/pkg/policy"
+	"github.com/flipkart-incubator/ottoscalr/pkg/registry"
 	"github.com/flipkart-incubator/ottoscalr/pkg/trigger"
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
@@ -24,8 +27,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/metrics"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-	"sigs.k8s.io/controller-runtime/pkg/source"
-	"time"
 )
 
 var (
@@ -49,21 +50,27 @@ type PolicyRecommendationRegistrar struct {
 	MonitorManager       trigger.MonitorManager
 	RequeueDelayDuration time.Duration
 	PolicyStore          policy.Store
+	ClientsRegistry      registry.DeploymentClientRegistry
 	ExcludedNamespaces   []string
+	IncludedNamespaces   []string
 }
 
 func NewPolicyRecommendationRegistrar(client client.Client,
 	scheme *runtime.Scheme,
 	requeueDelayMs int,
 	monitorManager trigger.MonitorManager,
-	policyStore policy.Store, excludedNamespaces []string) *PolicyRecommendationRegistrar {
+	policyStore policy.Store,
+	clientsRegistry registry.DeploymentClientRegistry,
+	excludedNamespaces []string, includedNamespaces []string) *PolicyRecommendationRegistrar {
 	return &PolicyRecommendationRegistrar{
 		Client:               client,
 		Scheme:               scheme,
 		MonitorManager:       monitorManager,
 		RequeueDelayDuration: time.Duration(requeueDelayMs) * time.Millisecond,
 		PolicyStore:          policyStore,
+		ClientsRegistry:      clientsRegistry,
 		ExcludedNamespaces:   excludedNamespaces,
+		IncludedNamespaces:   includedNamespaces,
 	}
 }
 
@@ -79,37 +86,20 @@ func (controller *PolicyRecommendationRegistrar) Reconcile(ctx context.Context,
 	logger := log.FromContext(ctx)
 	logger = logger.WithValues("request", request).WithName(PolicyRecoRegistrarCtrlName)
 
-	// Check if Rollout exists
-	rollout := argov1alpha1.Rollout{}
-	err := controller.Client.Get(ctx, request.NamespacedName, &rollout)
-	if err == nil {
-		// Rollout exists, create policy recommendation
-		return ctrl.Result{}, controller.handleReconcile(ctx, &rollout, controller.Scheme, logger)
+	for _, obj := range controller.ClientsRegistry.Clients {
+		object, err := obj.GetObject(request.Namespace, request.Name)
+		if err == nil {
+			return ctrl.Result{}, controller.handleReconcile(ctx, object, controller.Scheme, logger)
+		}
+		if errors.IsNotFound(err) {
+			policyRecoWorkloadGauge.DeletePartialMatch(prometheus.Labels{"namespace": request.Namespace, "policyreco": request.Name})
+		}
+		if !errors.IsNotFound(err) {
+			// Error occurred
+			logger.Error(err, "Failed to get. Requeue the request")
+			return ctrl.Result{RequeueAfter: controller.RequeueDelayDuration}, err
+		}
 	}
-
-	if !errors.IsNotFound(err) {
-		// Error occurred
-		logger.Error(err, "Failed to get Rollout. Requeue the request")
-		return ctrl.Result{RequeueAfter: controller.RequeueDelayDuration}, err
-	}
-
-	// Rollout doesn't exist. Check if Deployment exists
-	deployment := appsv1.Deployment{}
-	err = controller.Client.Get(ctx, request.NamespacedName, &deployment)
-	if err == nil {
-		// Deployment exists, create policy recommendation
-		return ctrl.Result{}, controller.handleReconcile(ctx, &deployment, controller.Scheme, logger)
-	}
-
-	if errors.IsNotFound(err) {
-		policyRecoWorkloadGauge.DeletePartialMatch(prometheus.Labels{"namespace": request.Namespace, "policyreco": request.Name})
-	}
-
-	if !errors.IsNotFound(err) {
-		logger.Error(err, "Failed to get Deployment. Requeue the request")
-		return ctrl.Result{RequeueAfter: controller.RequeueDelayDuration}, err
-	}
-
 	logger.Info("Rollout or Deployment not found. It could have been deleted.")
 	return ctrl.Result{}, nil
 }
@@ -249,48 +239,60 @@ func (controller *PolicyRecommendationRegistrar) SetupWithManager(mgr ctrl.Manag
 		},
 	}
 
-	enqueueFunc := func(obj client.Object) []reconcile.Request {
+	enqueueFunc := func(ctx context.Context, obj client.Object) []reconcile.Request {
 		return []reconcile.Request{{NamespacedName: types.NamespacedName{Name: obj.GetName(),
 			Namespace: obj.GetNamespace()}}}
 	}
 
-	return ctrl.NewControllerManagedBy(mgr).
+	controllerBuilder := ctrl.NewControllerManagedBy(mgr).
 		Named(PolicyRecoRegistrarCtrlName).
 		Watches(
-			&source.Kind{Type: &argov1alpha1.Rollout{}},
-			handler.EnqueueRequestsFromMapFunc(enqueueFunc),
-			builder.WithPredicates(createPredicate),
-		).
-		Watches(
-			&source.Kind{Type: &appsv1.Deployment{}},
-			handler.EnqueueRequestsFromMapFunc(enqueueFunc),
-			builder.WithPredicates(createPredicate),
-		).
-		Watches(
-			&source.Kind{Type: &ottoscaleriov1alpha1.PolicyRecommendation{}},
-			&handler.EnqueueRequestForOwner{
-				OwnerType:    &argov1alpha1.Rollout{},
-				IsController: true,
-			},
+			&ottoscaleriov1alpha1.PolicyRecommendation{},
+			handler.EnqueueRequestForOwner(
+				mgr.GetScheme(), mgr.GetRESTMapper(), &argov1alpha1.Rollout{},
+			),
 			builder.WithPredicates(deletePredicate),
 		).
 		Watches(
-			&source.Kind{Type: &ottoscaleriov1alpha1.PolicyRecommendation{}},
-			&handler.EnqueueRequestForOwner{
-				OwnerType:    &appsv1.Deployment{},
-				IsController: true,
-			},
+			&ottoscaleriov1alpha1.PolicyRecommendation{},
+			handler.EnqueueRequestForOwner(
+				mgr.GetScheme(), mgr.GetRESTMapper(), &appsv1.Deployment{},
+			),
 			builder.WithPredicates(deletePredicate),
-		).
-		WithEventFilter(namespaceFilter).
+		)
+
+	for _, object := range controller.ClientsRegistry.Clients {
+		controllerBuilder.Watches(
+			object.GetObjectType(),
+			handler.EnqueueRequestsFromMapFunc(enqueueFunc),
+			builder.WithPredicates(createPredicate),
+		)
+	}
+
+	return controllerBuilder.WithEventFilter(namespaceFilter).
 		Complete(controller)
 }
 
 func (controller *PolicyRecommendationRegistrar) isWhitelistedNamespace(namespace string) bool {
-	for _, ns := range controller.ExcludedNamespaces {
-		if namespace == ns {
-			return false
+
+	if len(controller.IncludedNamespaces) > 0 {
+		for _, ns := range controller.IncludedNamespaces {
+			if namespace == ns {
+				return true
+			}
 		}
+		return false
 	}
+
+	if len(controller.ExcludedNamespaces) > 0 {
+		for _, ns := range controller.ExcludedNamespaces {
+			if namespace == ns {
+				return false
+			}
+		}
+		return true
+
+	}
+
 	return true
 }

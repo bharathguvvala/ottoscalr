@@ -18,19 +18,24 @@ package controller
 
 import (
 	"errors"
+	"time"
+
 	rolloutv1alpha1 "github.com/argoproj/argo-rollouts/pkg/apis/rollouts/v1alpha1"
+	"github.com/flipkart-incubator/ottoscalr/pkg/autoscaler"
 	"github.com/flipkart-incubator/ottoscalr/pkg/reco"
+	"github.com/flipkart-incubator/ottoscalr/pkg/registry"
 	"github.com/flipkart-incubator/ottoscalr/pkg/testutil"
 	"github.com/flipkart-incubator/ottoscalr/pkg/trigger"
+	kedaapi "github.com/kedacore/keda/v2/apis/keda/v1alpha1"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"golang.org/x/net/context"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"time"
+
+	"testing"
 
 	ctrl "sigs.k8s.io/controller-runtime"
-	"testing"
 
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
@@ -46,14 +51,23 @@ import (
 // http://onsi.github.io/ginkgo/ to learn more about Ginkgo.
 
 var (
-	cfg       *rest.Config
-	k8sClient client.Client
-	ctx       context.Context
-	cancel    context.CancelFunc
+	cfg        *rest.Config
+	k8sClient  client.Client
+	k8sClient1 client.Client
+	ctx        context.Context
+	cancel     context.CancelFunc
 
-	queuedAllRecos     = false
-	recommender        *MockRecommender
-	excludedNamespaces []string
+	queuedAllRecos                 = false
+	queuedOneReco                  []bool
+	recommender                    *MockRecommender
+	deploymentTriggerControllerEnv *testutil.TestEnvironment
+	clientsRegistry                registry.DeploymentClientRegistry
+	excludedNamespaces             []string
+	includedNamespaces             []string
+	hpaEnforcerExcludedNamespaces  *[]string
+	hpaEnforcerIncludedNamespaces  *[]string
+	hpaEnforcerIsDryRun            *bool
+	whitelistMode                  *bool
 )
 
 const policyAge = 1 * time.Second
@@ -72,7 +86,7 @@ var _ = BeforeSuite(func() {
 	By("bootstrapping test environment")
 	var err error
 	// cfg is defined in this file globally.
-	cfg, ctx, cancel = testutil.SetupEnvironment()
+	cfg, ctx, cancel = testutil.SetupSingletonEnvironment()
 	Expect(cfg).NotTo(BeNil())
 
 	err = rolloutv1alpha1.AddToScheme(scheme.Scheme)
@@ -81,11 +95,35 @@ var _ = BeforeSuite(func() {
 	err = ottoscaleriov1alpha1.AddToScheme(scheme.Scheme)
 	Expect(err).NotTo(HaveOccurred())
 
+	err = kedaapi.AddToScheme(scheme.Scheme)
+	Expect(err).NotTo(HaveOccurred())
 	//+kubebuilder:scaffold:Scheme
 
 	k8sClient, err = client.New(cfg, client.Options{Scheme: scheme.Scheme})
 	Expect(err).NotTo(HaveOccurred())
 	Expect(k8sClient).NotTo(BeNil())
+
+	deploymentTriggerControllerEnv = testutil.SetupEnvironment()
+	k8sClient1, err = client.New(deploymentTriggerControllerEnv.Cfg, client.Options{Scheme: scheme.Scheme})
+	Expect(err).NotTo(HaveOccurred())
+	Expect(k8sClient1).NotTo(BeNil())
+	k8sManager1, err := ctrl.NewManager(deploymentTriggerControllerEnv.Cfg, ctrl.Options{
+		Scheme:             scheme.Scheme,
+		MetricsBindAddress: "0.0.0.0:0",
+	})
+	Expect(err).ToNot(HaveOccurred())
+
+	clientsRegistry = *registry.NewDeploymentClientRegistryBuilder().
+		WithK8sClient(k8sClient1).
+		WithCustomDeploymentClient(registry.NewDeploymentClient(k8sManager1.GetClient())).
+		WithCustomDeploymentClient(registry.NewRolloutClient(k8sManager1.GetClient())).
+		Build()
+	err = (&DeploymentTriggerController{
+		Client:          k8sManager1.GetClient(),
+		Scheme:          k8sManager1.GetScheme(),
+		ClientsRegistry: clientsRegistry,
+	}).SetupWithManager(k8sManager1)
+	Expect(err).ToNot(HaveOccurred())
 
 	k8sManager, err := ctrl.NewManager(cfg, ctrl.Options{
 		Scheme:             scheme.Scheme,
@@ -94,13 +132,21 @@ var _ = BeforeSuite(func() {
 	Expect(err).ToNot(HaveOccurred())
 
 	excludedNamespaces = []string{"namespace1", "namespace2"}
+	includedNamespaces = []string{}
 
+	clientsRegistry = *registry.NewDeploymentClientRegistryBuilder().
+		WithK8sClient(k8sManager.GetClient()).
+		WithCustomDeploymentClient(registry.NewDeploymentClient(k8sManager.GetClient())).
+		WithCustomDeploymentClient(registry.NewRolloutClient(k8sManager.GetClient())).
+		Build()
 	err = (&PolicyRecommendationRegistrar{
 		Client:             k8sManager.GetClient(),
 		Scheme:             k8sManager.GetScheme(),
 		MonitorManager:     &FakeMonitorManager{},
 		PolicyStore:        newFakePolicyStore(),
+		ClientsRegistry:    clientsRegistry,
 		ExcludedNamespaces: excludedNamespaces,
+		IncludedNamespaces: includedNamespaces,
 	}).SetupWithManager(k8sManager)
 	Expect(err).ToNot(HaveOccurred())
 
@@ -110,6 +156,11 @@ var _ = BeforeSuite(func() {
 		requeueAllFunc: func() {
 			queuedAllRecos = true
 		},
+		requeueOneFunc: func(namespacedName types.NamespacedName) {
+			if namespacedName.Name == "test-deployment-afgre" || namespacedName.Name == "test-deployment-afgre2" {
+				queuedOneReco = append(queuedOneReco, true)
+			}
+		},
 	}).SetupWithManager(k8sManager)
 	Expect(err).ToNot(HaveOccurred())
 
@@ -117,10 +168,27 @@ var _ = BeforeSuite(func() {
 
 	policyRecoReconciler, err := NewPolicyRecommendationReconciler(k8sManager.GetClient(),
 		k8sManager.GetScheme(), k8sManager.GetEventRecorderFor(PolicyRecoWorkflowCtrlName),
-		1, 3, recommender, reco.NewDefaultPolicyIterator(k8sManager.GetClient()),
+		1, 3, recommender, newFakePolicyStore(), reco.NewDefaultPolicyIterator(k8sManager.GetClient()),
 		reco.NewAgingPolicyIterator(k8sManager.GetClient(), policyAge))
 	Expect(err).NotTo(HaveOccurred())
 	err = policyRecoReconciler.
+		SetupWithManager(k8sManager)
+	Expect(err).ToNot(HaveOccurred())
+
+	hpaEnforcerIsDryRun = new(bool)
+	whitelistMode = new(bool)
+
+	hpaEnforcerExcludedNamespaces = new([]string)
+	hpaEnforcerIncludedNamespaces = new([]string)
+	*hpaEnforcerIsDryRun = falseBool
+	*whitelistMode = falseBool
+	var autoscalerCRUD autoscaler.AutoscalerClient
+	autoscalerCRUD = autoscaler.NewScaledobjectClient(k8sManager.GetClient())
+	hpaenforcer, err := NewHPAEnforcementController(k8sManager.GetClient(),
+		k8sManager.GetScheme(),clientsRegistry, k8sManager.GetEventRecorderFor(HPAEnforcementCtrlName),
+		1, hpaEnforcerIsDryRun, hpaEnforcerExcludedNamespaces, hpaEnforcerIncludedNamespaces, whitelistMode, 3, autoscalerCRUD)
+	Expect(err).NotTo(HaveOccurred())
+	err = hpaenforcer.
 		SetupWithManager(k8sManager)
 	Expect(err).ToNot(HaveOccurred())
 
@@ -129,12 +197,19 @@ var _ = BeforeSuite(func() {
 		err = k8sManager.Start(ctx)
 		Expect(err).ToNot(HaveOccurred(), "failed to run manager")
 	}()
+	go func() {
+		defer GinkgoRecover()
+		err = k8sManager1.Start(ctx)
+		Expect(err).ToNot(HaveOccurred(), "failed to run manager")
+	}()
 })
 
 var _ = AfterSuite(func() {
 	cancel()
 	By("tearing down the test environment")
-	err := testutil.TeardownEnvironment()
+	err := testutil.TeardownSingletonEnvironment()
+	Expect(err).NotTo(HaveOccurred())
+	err = testutil.TeardownEnvironment(deploymentTriggerControllerEnv)
 	Expect(err).NotTo(HaveOccurred())
 })
 
@@ -160,7 +235,7 @@ func newFakePolicyStore() *FakePolicyStore {
 			Spec: ottoscaleriov1alpha1.PolicySpec{
 				IsDefault:               false,
 				RiskIndex:               1,
-				MinReplicaPercentageCut: 80,
+				MinReplicaPercentageCut: 100,
 				TargetUtilization:       10,
 			},
 		},
@@ -239,7 +314,7 @@ func (ps *FakePolicyStore) GetPreviousPolicyByName(name string) (*ottoscaleriov1
 func (ps *FakePolicyStore) GetSortedPolicies() (*ottoscaleriov1alpha1.PolicyList,
 	error) {
 	return &ottoscaleriov1alpha1.PolicyList{
-		Items: nil,
+		Items: ps.policies,
 	}, nil
 }
 

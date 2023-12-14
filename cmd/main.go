@@ -17,22 +17,27 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"flag"
 	argov1alpha1 "github.com/argoproj/argo-rollouts/pkg/apis/rollouts/v1alpha1"
+	"github.com/flipkart-incubator/ottoscalr/pkg/autoscaler"
 	"github.com/flipkart-incubator/ottoscalr/pkg/controller"
 	"github.com/flipkart-incubator/ottoscalr/pkg/integration"
 	"github.com/flipkart-incubator/ottoscalr/pkg/metrics"
 	"github.com/flipkart-incubator/ottoscalr/pkg/policy"
 	"github.com/flipkart-incubator/ottoscalr/pkg/reco"
+	"github.com/flipkart-incubator/ottoscalr/pkg/registry"
 	"github.com/flipkart-incubator/ottoscalr/pkg/transformer"
 	"github.com/flipkart-incubator/ottoscalr/pkg/trigger"
+	kedaapi "github.com/kedacore/keda/v2/apis/keda/v1alpha1"
 	"github.com/spf13/viper"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"strings"
 	"syscall"
 	"time"
-
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
@@ -49,14 +54,16 @@ import (
 )
 
 var (
-	scheme   = runtime.NewScheme()
-	setupLog = ctrl.Log.WithName("setup")
+	scaledTargetName = "spec.scaleTargetRef.name"
+	scheme           = runtime.NewScheme()
+	setupLog         = ctrl.Log.WithName("setup")
 )
 
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(argov1alpha1.AddToScheme(scheme))
 	utilruntime.Must(ottoscaleriov1alpha1.AddToScheme(scheme))
+	utilruntime.Must(kedaapi.AddToScheme(scheme))
 	//+kubebuilder:scaffold:scheme
 }
 
@@ -73,9 +80,10 @@ type Config struct {
 	} `yaml:"metricsScraper"`
 
 	BreachMonitor struct {
-		PollingIntervalSec int     `yaml:"pollingIntervalSec"`
-		CpuRedLine         float64 `yaml:"cpuRedLine"`
-		StepSec            int     `yaml:"stepSec"`
+		PollingIntervalSec   int     `yaml:"pollingIntervalSec"`
+		CpuRedLine           float64 `yaml:"cpuRedLine"`
+		StepSec              int     `yaml:"stepSec"`
+		ConcurrentExecutions int     `yaml:"concurrentExecutions"`
 	} `yaml:"breachMonitor"`
 
 	PeriodicTrigger struct {
@@ -88,25 +96,44 @@ type Config struct {
 		PolicyExpiryAge         string `yaml:"policyExpiryAge"`
 	} `yaml:"policyRecommendationController"`
 
+	HPAEnforcer struct {
+		MaxConcurrentReconciles int    `yaml:"maxConcurrentReconciles"`
+		ExcludedNamespaces      string `yaml:"excludedNamespaces"`
+		IncludedNamespaces      string `yaml:"includedNamespaces"`
+		IsDryRun                *bool  `yaml:"isDryRun"`
+		WhitelistMode           *bool  `yaml:"whitelistMode"`
+		MinRequiredReplicas     int    `yaml:"minRequiredReplicas"`
+	} `yaml:"hpaEnforcer"`
+
 	PolicyRecommendationRegistrar struct {
 		RequeueDelayMs     int    `yaml:"requeueDelayMs"`
 		ExcludedNamespaces string `yaml:"excludedNamespaces"`
+		IncludedNamespaces string `yaml:"includedNamespaces"`
 	} `yaml:"policyRecommendationRegistrar"`
 
 	CpuUtilizationBasedRecommender struct {
-		MetricWindowInDays int `yaml:"metricWindowInDays"`
-		StepSec            int `yaml:"stepSec"`
-		MinTarget          int `yaml:"minTarget"`
-		MaxTarget          int `yaml:"minTarget"`
+		MetricWindowInDays         int `yaml:"metricWindowInDays"`
+		StepSec                    int `yaml:"stepSec"`
+		MinTarget                  int `yaml:"minTarget"`
+		MaxTarget                  int `yaml:"minTarget"`
+		MetricsPercentageThreshold int `yaml:"metricsPercentageThreshold"`
 	} `yaml:"cpuUtilizationBasedRecommender"`
 	MetricIngestionTime      float64 `yaml:"metricIngestionTime"`
 	MetricProbeTime          float64 `yaml:"metricProbeTime"`
 	EnableMetricsTransformer *bool   `yaml:"enableMetricsTransformation"`
 	EventCallIntegration     struct {
-		EventCalendarAPIEndpoint string `yaml:"eventCalendarAPIEndpoint"`
-		EventFetchWindowInHours  int    `yaml:"eventFetchWindowInHours"`
+		EventCalendarAPIEndpoint        string `yaml:"eventCalendarAPIEndpoint"`
+		NfrEventCompletedAPIEndpoint    string `yaml:"nfrEventCompletedAPIEndpoint"`
+		NfrEventInProgressAPIEndpoint   string `yaml:"nfrEventInProgressAPIEndpoint"`
+		EventFetchWindowInHours         int    `yaml:"eventFetchWindowInHours"`
+		EventScaleUpBufferPeriodInHours int    `yaml:"eventScaleUpBufferPeriodInHours"`
+		CustomEventDataConfigMapName    string `yaml:"customEventDataConfigMapName"`
 	} `yaml:"eventCallIntegration"`
-	NfrDataConfigMapName string `yaml:"nfrDataConfigMapName"`
+	AutoscalerClient struct {
+		EnableScaledObject *bool  `yaml:"enableScaledObject"`
+		HpaAPIVersion      string `yaml:"hpaAPIVersion"`
+	} `yaml:"autoscalerClient"`
+	EnableArgoRolloutsSupport *bool `yaml:"enableArgoRolloutsSupport"`
 }
 
 func main() {
@@ -144,6 +171,7 @@ func main() {
 		MetricsBindAddress:     config.MetricBindAddress,
 		Port:                   config.Port,
 		HealthProbeBindAddress: config.HealthProbeBindAddress,
+		PprofBindAddress:       config.MetricBindAddress,
 		LeaderElection:         config.EnableLeaderElection,
 		LeaderElectionID:       config.LeaderElectionID,
 		// LeaderElectionReleaseOnCancel defines if the leader should step down voluntarily
@@ -169,11 +197,14 @@ func main() {
 		agingPolicyTTL = 48 * time.Hour
 	}
 
-	scraper, err := metrics.NewPrometheusScraper(config.MetricsScraper.PrometheusUrl,
+	prometheusInstances := parseCommaSeparatedValues(config.MetricsScraper.PrometheusUrl)
+
+	scraper, err := metrics.NewPrometheusScraper(prometheusInstances,
 		time.Duration(config.MetricsScraper.QueryTimeoutSec)*time.Second,
 		time.Duration(config.MetricsScraper.QuerySplitIntervalHr)*time.Hour,
 		config.MetricIngestionTime,
 		config.MetricProbeTime,
+		logger,
 	)
 	if err != nil {
 		setupLog.Error(err, "unable to start prometheus scraper")
@@ -182,27 +213,38 @@ func main() {
 
 	var eventIntegrations []integration.EventIntegration
 	eventCalendarIntegration, err := integration.NewEventCalendarDataFetcher(config.EventCallIntegration.EventCalendarAPIEndpoint,
-		time.Duration(config.EventCallIntegration.EventFetchWindowInHours)*time.Hour, logger)
+		time.Duration(config.EventCallIntegration.EventFetchWindowInHours)*time.Hour,
+		time.Duration(config.EventCallIntegration.EventScaleUpBufferPeriodInHours)*time.Hour, logger)
 
 	if err != nil {
 		setupLog.Error(err, "unable to start event calendar data fetcher")
 		os.Exit(1)
 	}
 
-	nfrEventIntegration, err := integration.NewNFREventDataFetcher(mgr.GetClient(),
-		os.Getenv("DEPLOYMENT_NAMESPACE"), config.NfrDataConfigMapName)
+	nfrEventIntegration, err := integration.NewNFREventDataFetcher(config.EventCallIntegration.NfrEventCompletedAPIEndpoint,
+		config.EventCallIntegration.NfrEventInProgressAPIEndpoint,
+		time.Duration(config.EventCallIntegration.EventFetchWindowInHours)*time.Hour,
+		time.Duration(config.EventCallIntegration.EventScaleUpBufferPeriodInHours)*time.Hour, logger)
 
 	if err != nil {
 		setupLog.Error(err, "unable to start nfr event data fetcher")
 		os.Exit(1)
 	}
 
-	eventIntegrations = append(eventIntegrations, eventCalendarIntegration, nfrEventIntegration)
+	customEventIntegration, err := integration.NewCustomEventDataFetcher(mgr.GetClient(),
+		os.Getenv("DEPLOYMENT_NAMESPACE"), config.EventCallIntegration.CustomEventDataConfigMapName, logger)
+
+	if err != nil {
+		setupLog.Error(err, "unable to start custom event data fetcher")
+		os.Exit(1)
+	}
+
+	eventIntegrations = append(eventIntegrations, eventCalendarIntegration, nfrEventIntegration, customEventIntegration)
 
 	var metricsTransformer []metrics.MetricsTransformer
 
 	if *config.EnableMetricsTransformer == true {
-		outlierInterpolatorTransformer, err := transformer.NewOutlierInterpolatorTransformer(eventIntegrations)
+		outlierInterpolatorTransformer, err := transformer.NewOutlierInterpolatorTransformer(eventIntegrations, logger)
 		if err != nil {
 			setupLog.Error(err, "unable to start metrics transformer")
 			os.Exit(1)
@@ -210,7 +252,14 @@ func main() {
 
 		metricsTransformer = append(metricsTransformer, outlierInterpolatorTransformer)
 	}
+	deploymentClientRegistryBuilder := registry.NewDeploymentClientRegistryBuilder().
+		WithK8sClient(mgr.GetClient()).
+		WithCustomDeploymentClient(registry.NewDeploymentClient(mgr.GetClient()))
 
+	if *config.EnableArgoRolloutsSupport {
+		deploymentClientRegistryBuilder = deploymentClientRegistryBuilder.WithCustomDeploymentClient(registry.NewRolloutClient(mgr.GetClient()))
+	}
+	deploymentClientRegistry := deploymentClientRegistryBuilder.Build()
 	cpuUtilizationBasedRecommender := reco.NewCpuUtilizationBasedRecommender(mgr.GetClient(),
 		config.BreachMonitor.CpuRedLine,
 		time.Duration(config.CpuUtilizationBasedRecommender.MetricWindowInDays)*24*time.Hour,
@@ -219,6 +268,8 @@ func main() {
 		time.Duration(config.CpuUtilizationBasedRecommender.StepSec)*time.Second,
 		config.CpuUtilizationBasedRecommender.MinTarget,
 		config.CpuUtilizationBasedRecommender.MaxTarget,
+		config.CpuUtilizationBasedRecommender.MetricsPercentageThreshold,
+		*deploymentClientRegistry,
 		logger)
 
 	breachAnalyzer, err := reco.NewBreachAnalyzer(mgr.GetClient(), scraper, config.BreachMonitor.CpuRedLine, time.Duration(config.BreachMonitor.StepSec)*time.Second)
@@ -227,9 +278,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	policyStore := policy.NewPolicyStore(mgr.GetClient())
+
 	policyRecoReconciler, err := controller.NewPolicyRecommendationReconciler(mgr.GetClient(),
 		mgr.GetScheme(), mgr.GetEventRecorderFor(controller.PolicyRecoWorkflowCtrlName),
-		config.PolicyRecommendationController.MaxConcurrentReconciles, config.PolicyRecommendationController.MinRequiredReplicas, cpuUtilizationBasedRecommender, reco.NewDefaultPolicyIterator(mgr.GetClient()), reco.NewAgingPolicyIterator(mgr.GetClient(), agingPolicyTTL), breachAnalyzer)
+		config.PolicyRecommendationController.MaxConcurrentReconciles, config.PolicyRecommendationController.MinRequiredReplicas, cpuUtilizationBasedRecommender, policyStore, reco.NewDefaultPolicyIterator(mgr.GetClient()), reco.NewAgingPolicyIterator(mgr.GetClient(), agingPolicyTTL), breachAnalyzer)
 	if err != nil {
 		setupLog.Error(err, "Unable to initialize policy reco reconciler")
 		os.Exit(1)
@@ -240,6 +293,14 @@ func main() {
 		setupLog.Error(err, "unable to create controller", "controller", "PolicyRecommendation")
 		os.Exit(1)
 	}
+
+	deploymentTriggerReconciler := controller.NewDeploymentTriggerController(mgr.GetClient(), mgr.GetScheme(), *deploymentClientRegistry)
+	if err = deploymentTriggerReconciler.
+		SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "DeploymentController")
+		os.Exit(1)
+	}
+
 	triggerHandler := trigger.NewK8sTriggerHandler(mgr.GetClient(), logger)
 	triggerHandler.Start()
 
@@ -248,19 +309,47 @@ func main() {
 		scraper,
 		time.Duration(config.PeriodicTrigger.PollingIntervalMin)*time.Minute,
 		time.Duration(config.BreachMonitor.PollingIntervalSec)*time.Second,
+		config.BreachMonitor.ConcurrentExecutions,
 		triggerHandler.QueueForExecution,
 		config.BreachMonitor.StepSec,
 		config.BreachMonitor.CpuRedLine,
 		logger)
 
-	excludedNamespaces := parseExcludedNamespaces(config.PolicyRecommendationRegistrar.ExcludedNamespaces)
+	excludedNamespaces := parseCommaSeparatedValues(config.PolicyRecommendationRegistrar.ExcludedNamespaces)
+	includedNamespaces := parseCommaSeparatedValues(config.PolicyRecommendationRegistrar.IncludedNamespaces)
 
-	policyStore := policy.NewPolicyStore(mgr.GetClient())
+	hpaEnforcerExcludedNamespaces := parseCommaSeparatedValues(config.HPAEnforcer.ExcludedNamespaces)
+	hpaEnforcerIncludedNamespaces := parseCommaSeparatedValues(config.HPAEnforcer.IncludedNamespaces)
+
+	var autoscalerClient autoscaler.AutoscalerClient
+	if *config.AutoscalerClient.EnableScaledObject {
+		autoscalerClient = autoscaler.NewScaledobjectClient(mgr.GetClient())
+	} else {
+		if config.AutoscalerClient.HpaAPIVersion == "v2" {
+			autoscalerClient = autoscaler.NewHPAClientV2(mgr.GetClient())
+		} else {
+			autoscalerClient = autoscaler.NewHPAClient(mgr.GetClient())
+		}
+	}
+	hpaEnforcementController, err := controller.NewHPAEnforcementController(mgr.GetClient(),
+		mgr.GetScheme(),*deploymentClientRegistry, mgr.GetEventRecorderFor(controller.HPAEnforcementCtrlName),
+		config.HPAEnforcer.MaxConcurrentReconciles, config.HPAEnforcer.IsDryRun, &hpaEnforcerExcludedNamespaces, &hpaEnforcerIncludedNamespaces, config.HPAEnforcer.WhitelistMode, config.HPAEnforcer.MinRequiredReplicas, autoscalerClient)
+	if err != nil {
+		setupLog.Error(err, "Unable to initialize HPA enforcement controller")
+		os.Exit(1)
+	}
+
+	if err = hpaEnforcementController.
+		SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "HPAEnforcementController")
+		os.Exit(1)
+	}
+
 	if err = controller.NewPolicyRecommendationRegistrar(mgr.GetClient(),
 		mgr.GetScheme(),
 		config.PolicyRecommendationRegistrar.RequeueDelayMs,
 		monitorManager,
-		policyStore, excludedNamespaces).SetupWithManager(mgr); err != nil {
+		policyStore, *deploymentClientRegistry, excludedNamespaces, includedNamespaces).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller",
 			"controller", "PolicyRecommendationRegistration")
 		os.Exit(1)
@@ -268,7 +357,8 @@ func main() {
 
 	if err = controller.NewPolicyWatcher(mgr.GetClient(),
 		mgr.GetScheme(),
-		triggerHandler.QueueAllForExecution).SetupWithManager(mgr); err != nil {
+		triggerHandler.QueueAllForExecution,
+		triggerHandler.QueueForExecution).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Policy")
 		os.Exit(1)
 	}
@@ -280,6 +370,17 @@ func main() {
 	}
 	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up ready check")
+		os.Exit(1)
+	}
+
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &kedaapi.ScaledObject{}, scaledTargetName, func(obj client.Object) []string {
+		scaledObject := obj.(*kedaapi.ScaledObject)
+		if scaledObject.Spec.ScaleTargetRef.Name == "" {
+			return nil
+		}
+		return []string{scaledObject.Spec.ScaleTargetRef.Name}
+	}); err != nil {
+		setupLog.Error(err, "unable to index scaledobject")
 		os.Exit(1)
 	}
 
@@ -300,11 +401,14 @@ func main() {
 	}()
 }
 
-func parseExcludedNamespaces(namespaces string) []string {
-	splitNamespaces := strings.Split(namespaces, ",")
-	var excludedNamespaces []string
-	for _, namespace := range splitNamespaces {
-		excludedNamespaces = append(excludedNamespaces, strings.TrimSpace(namespace))
+func parseCommaSeparatedValues(givenConfig string) []string {
+	if givenConfig == "" {
+		return nil
 	}
-	return excludedNamespaces
+	splitValues := strings.Split(givenConfig, ",")
+	var parsedValues []string
+	for _, namespace := range splitValues {
+		parsedValues = append(parsedValues, strings.TrimSpace(namespace))
+	}
+	return parsedValues
 }
