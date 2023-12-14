@@ -20,3 +20,5 @@ TBA
 TBA
 
 ### Configuration
+
+TBA on how to configure the ottoscalr deployment
